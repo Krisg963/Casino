@@ -201,6 +201,15 @@ export async function registerRoutes(httpServer: any, app: Express): Promise<Ser
     res.json(symbols);
   });
 
+  const freeSpinsStore = new Map<string, { remaining: number; betAmount: number; slotId: string }>();
+
+  app.get("/api/slots/:id/freespins", requireAuth, (req, res) => {
+    const user = req.user as any;
+    const key = `${user.id}:${req.params.id}`;
+    const fs = freeSpinsStore.get(key);
+    res.json({ freeSpins: fs?.remaining ?? 0, betAmount: fs?.betAmount ?? 0 });
+  });
+
   app.post("/api/slots/:id/spin", requireAuth, async (req, res) => {
     try {
       const user = req.user as any;
@@ -209,37 +218,70 @@ export async function registerRoutes(httpServer: any, app: Express): Promise<Ser
       const { betAmount } = parsed.data;
       const freshUser = await storage.getUser(user.id);
       if (!freshUser) return res.status(404).json({ message: "Bruker ikke funnet" });
-      if (freshUser.balance < betAmount) return res.status(400).json({ message: "Ikke nok saldo" });
       const slot = await storage.getSlot(req.params.id);
       if (!slot || !slot.isActive) return res.status(404).json({ message: "Spill ikke tilgjengelig" });
-      if (betAmount < slot.minBet) return res.status(400).json({ message: `Minimum innsats er ${slot.minBet} kr` });
-      if (betAmount > slot.maxBet) return res.status(400).json({ message: `Maksimum innsats er ${slot.maxBet} kr` });
+
+      const fsKey = `${user.id}:${slot.id}`;
+      const freeSpinData = freeSpinsStore.get(fsKey);
+      const isFreeSpin = freeSpinData && freeSpinData.remaining > 0;
+
+      if (!isFreeSpin) {
+        if (betAmount < slot.minBet) return res.status(400).json({ message: `Minimum innsats er ${slot.minBet} kr` });
+        if (betAmount > slot.maxBet) return res.status(400).json({ message: `Maksimum innsats er ${slot.maxBet} kr` });
+        if (freshUser.balance < betAmount) return res.status(400).json({ message: "Ikke nok saldo" });
+      }
+
+      const effectiveBet = isFreeSpin ? freeSpinData!.betAmount : betAmount;
 
       const reels = spinReels(slot.themeKey);
-      const { winAmount, multiplier, winningLines } = calculateWin(reels, betAmount, slot.themeKey);
+      const { winAmount, multiplier, winningLines, freeSpinsWon, scatterCount } = calculateWin(reels, effectiveBet, slot.themeKey);
 
       const balanceBefore = freshUser.balance;
-      const balanceAfterBet = parseFloat((balanceBefore - betAmount).toFixed(2));
-      const balanceAfter = parseFloat((balanceAfterBet + winAmount).toFixed(2));
+      let balanceAfter: number;
+      if (isFreeSpin) {
+        balanceAfter = parseFloat((balanceBefore + winAmount).toFixed(2));
+        freeSpinData!.remaining--;
+        if (freeSpinData!.remaining <= 0) freeSpinsStore.delete(fsKey);
+      } else {
+        const balanceAfterBet = parseFloat((balanceBefore - betAmount).toFixed(2));
+        balanceAfter = parseFloat((balanceAfterBet + winAmount).toFixed(2));
+      }
+
+      if (freeSpinsWon > 0) {
+        const existing = freeSpinsStore.get(fsKey);
+        const currentRemaining = existing?.remaining ?? 0;
+        freeSpinsStore.set(fsKey, {
+          remaining: currentRemaining + freeSpinsWon,
+          betAmount: effectiveBet,
+          slotId: slot.id,
+        });
+      }
 
       await storage.updateUserBalance(user.id, balanceAfter);
 
-      const txDesc = winAmount > 0
-        ? `Spinn i ${slot.name} - Vant ${winAmount.toFixed(2)} kr (${multiplier}x)`
-        : `Spinn i ${slot.name} - Tapte ${betAmount.toFixed(2)} kr`;
+      const txDesc = isFreeSpin
+        ? `Gratis spinn i ${slot.name}${winAmount > 0 ? ` - Vant ${winAmount.toFixed(2)} kr` : ""}`
+        : winAmount > 0
+          ? `Spinn i ${slot.name} - Vant ${winAmount.toFixed(2)} kr (${multiplier}x)`
+          : `Spinn i ${slot.name} - Tapte ${betAmount.toFixed(2)} kr`;
 
       await storage.createTransaction({
         userId: user.id, type: winAmount > 0 ? "win" : "loss",
-        amount: winAmount > 0 ? winAmount - betAmount : -betAmount,
+        amount: isFreeSpin ? winAmount : (winAmount > 0 ? winAmount - betAmount : -betAmount),
         description: txDesc, balanceBefore, balanceAfter,
       });
 
       await storage.createGameSession({
-        userId: user.id, slotId: slot.id, betAmount, winAmount,
+        userId: user.id, slotId: slot.id, betAmount: effectiveBet, winAmount,
         reels, isWin: winAmount > 0, multiplier,
       });
 
-      res.json({ reels, winAmount, multiplier, winningLines, newBalance: balanceAfter });
+      const updatedFs = freeSpinsStore.get(fsKey);
+      res.json({
+        reels, winAmount, multiplier, winningLines, newBalance: balanceAfter,
+        freeSpinsWon, freeSpinsRemaining: updatedFs?.remaining ?? 0,
+        scatterCount, isFreeSpin: !!isFreeSpin,
+      });
     } catch (err) {
       console.error("Spin error:", err);
       res.status(500).json({ message: "Feil ved spinn" });

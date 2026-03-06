@@ -96,10 +96,14 @@ server/
 - `game_sessions` - Individual spin records with reel results
 
 ## Slot Game Mechanics
-- 3 reels, 3 rows each = 9 symbols visible
-- 5 paylines: 3 horizontal rows + 2 diagonals
-- 6 symbols per theme with different weights and multipliers
-- Win = betAmount × symbolValue when a full row/diagonal matches
+- 5 reels, 3 rows each = 15 symbols visible (2D slot machine layout)
+- 9 paylines: 3 horizontal rows + 2 diagonals + 4 zigzag patterns
+- 6 regular symbols per theme + 1 scatter symbol (FREE, gold)
+- Symbol values: value3/value4/value5 for 3/4/5 consecutive matches from left
+- Scatter symbol triggers free spins: 3 scatters = 5, 4 = 10, 5+ = 15 free spins
+- Free spins use the bet amount from when they were won (no balance deduction)
+- Free spins can re-trigger during free spin rounds
+- Free spins tracked in-memory per user+slot on the server
 - Server-side spin generation and win calculation
 
 ## Theme
