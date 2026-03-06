@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowLeft, Play, Zap, Trophy, RotateCcw, Wallet, Info, Star } from "lucide-react";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { SlotSymbol } from "@/components/SlotSymbol";
 
 interface Slot {
@@ -59,6 +59,10 @@ const VOLATILITY_COLOR: Record<string, string> = {
 
 const REEL_COUNT = 5;
 const ROW_COUNT = 3;
+const SYMBOL_HEIGHT = 72;
+const VISIBLE_HEIGHT = SYMBOL_HEIGHT * ROW_COUNT;
+const SPIN_SYMBOLS = 20;
+const REEL_STOP_DELAY = 350;
 
 export default function SlotGame() {
   const { id } = useParams<{ id: string }>();
@@ -77,9 +81,17 @@ export default function SlotGame() {
   const [freeSpins, setFreeSpins] = useState(0);
   const [freeSpinBet, setFreeSpinBet] = useState(0);
   const [showFreeSpinBanner, setShowFreeSpinBanner] = useState(false);
-  const spinInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const [autoSpin, setAutoSpin] = useState(false);
   const autoSpinRef = useRef(false);
+
+  const [reelOffsets, setReelOffsets] = useState<number[]>(Array(REEL_COUNT).fill(0));
+  const [reelStrips, setReelStrips] = useState<string[][]>(Array(REEL_COUNT).fill([]));
+  const [reelStates, setReelStates] = useState<("idle" | "spinning" | "stopping" | "stopped")[]>(
+    Array(REEL_COUNT).fill("idle")
+  );
+  const [flashingReels, setFlashingReels] = useState<boolean[]>(Array(REEL_COUNT).fill(false));
+  const animFrameRef = useRef<number | null>(null);
+  const spinStartTimeRef = useRef<number>(0);
 
   useEffect(() => {
     if (!user) navigate("/login");
@@ -107,9 +119,106 @@ export default function SlotGame() {
 
   useEffect(() => {
     if (symbols?.length && displayReels[0][0] === "") {
-      setDisplayReels(Array(REEL_COUNT).fill(null).map(() => Array(ROW_COUNT).fill(symbols[0].id)));
+      const initial = Array(REEL_COUNT).fill(null).map(() =>
+        Array(ROW_COUNT).fill(null).map(() => symbols[0].id)
+      );
+      setDisplayReels(initial);
     }
   }, [symbols]);
+
+  const randomSymbolId = useCallback((syms: SlotSymbolData[]) => {
+    return syms[Math.floor(Math.random() * syms.length)].id;
+  }, []);
+
+  const buildReelStrip = useCallback((finalSymbols: string[], syms: SlotSymbolData[]): string[] => {
+    const strip: string[] = [];
+    for (let i = 0; i < SPIN_SYMBOLS; i++) {
+      strip.push(randomSymbolId(syms));
+    }
+    strip.push(...finalSymbols);
+    return strip;
+  }, [randomSymbolId]);
+
+  const animateReels = useCallback((finalReels: string[][], syms: SlotSymbolData[]): Promise<void> => {
+    return new Promise((resolve) => {
+      const strips = finalReels.map(col => buildReelStrip(col, syms));
+      setReelStrips(strips);
+      setReelStates(Array(REEL_COUNT).fill("spinning"));
+      setReelOffsets(Array(REEL_COUNT).fill(0));
+      setFlashingReels(Array(REEL_COUNT).fill(false));
+
+      spinStartTimeRef.current = performance.now();
+      const totalStripHeight = (SPIN_SYMBOLS + ROW_COUNT) * SYMBOL_HEIGHT;
+      const targetOffset = totalStripHeight - VISIBLE_HEIGHT;
+
+      const baseDuration = 1200;
+      const reelDurations = Array(REEL_COUNT).fill(null).map((_, i) => baseDuration + i * REEL_STOP_DELAY);
+
+      let resolved = false;
+
+      const animate = (now: number) => {
+        const elapsed = now - spinStartTimeRef.current;
+        const newOffsets: number[] = [];
+        const newStates: ("idle" | "spinning" | "stopping" | "stopped")[] = [];
+        let allDone = true;
+
+        for (let i = 0; i < REEL_COUNT; i++) {
+          const duration = reelDurations[i];
+          if (elapsed >= duration) {
+            newOffsets.push(targetOffset);
+            newStates.push("stopped");
+
+            setFlashingReels(prev => {
+              const next = [...prev];
+              if (!next[i]) {
+                next[i] = true;
+                setTimeout(() => {
+                  setFlashingReels(p => {
+                    const n = [...p];
+                    n[i] = false;
+                    return n;
+                  });
+                }, 400);
+              }
+              return next;
+            });
+          } else {
+            allDone = false;
+            const progress = elapsed / duration;
+            const eased = progress < 0.7
+              ? progress / 0.7
+              : 1 - Math.pow(1 - (progress - 0.7) / 0.3, 3) * 0.05 + 0.95 + Math.sin((progress - 0.7) / 0.3 * Math.PI * 2) * 0.02 * (1 - progress);
+
+            const offset = eased * targetOffset;
+            newOffsets.push(offset);
+            newStates.push(progress < 0.7 ? "spinning" : "stopping");
+          }
+        }
+
+        setReelOffsets(newOffsets);
+        setReelStates(newStates);
+
+        if (allDone) {
+          setDisplayReels(finalReels);
+          setSpinning(false);
+          if (!resolved) {
+            resolved = true;
+            setTimeout(resolve, 100);
+          }
+        } else {
+          animFrameRef.current = requestAnimationFrame(animate);
+        }
+      };
+
+      animFrameRef.current = requestAnimationFrame(animate);
+    });
+  }, [buildReelStrip]);
+
+  useEffect(() => {
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, []);
 
   const spinMutation = useMutation({
     mutationFn: async (bet: number) => {
@@ -152,6 +261,7 @@ export default function SlotGame() {
     },
     onError: (err: Error) => {
       setSpinning(false);
+      setReelStates(Array(REEL_COUNT).fill("idle"));
       toast({ title: "Feil", description: err.message, variant: "destructive" });
       if (autoSpinRef.current) {
         setAutoSpin(false);
@@ -159,27 +269,6 @@ export default function SlotGame() {
       }
     },
   });
-
-  const animateReels = (finalReels: string[][], syms: SlotSymbolData[]): Promise<void> => {
-    return new Promise((resolve) => {
-      let ticks = 0;
-      const maxTicks = 20;
-      spinInterval.current = setInterval(() => {
-        ticks++;
-        setDisplayReels(Array(REEL_COUNT).fill(null).map((_, col) => {
-          const stopAt = maxTicks - (REEL_COUNT - col) * 2;
-          if (ticks > stopAt) return finalReels[col];
-          return Array(ROW_COUNT).fill(null).map(() => syms[Math.floor(Math.random() * syms.length)].id);
-        }));
-        if (ticks >= maxTicks) {
-          clearInterval(spinInterval.current!);
-          setDisplayReels(finalReels);
-          setSpinning(false);
-          resolve();
-        }
-      }, 70);
-    });
-  };
 
   const doSpin = () => {
     if (spinning) return;
@@ -224,6 +313,12 @@ export default function SlotGame() {
     );
   }
 
+  const isSpinning = reelStates.some(s => s === "spinning" || s === "stopping");
+  const allStopped = reelStates.every(s => s === "stopped" || s === "idle");
+
+  const ledCount = 24;
+  const leds = Array(ledCount).fill(null);
+
   return (
     <div className="min-h-screen bg-background">
       <div className="mx-auto max-w-4xl px-4 py-4 space-y-4">
@@ -266,149 +361,216 @@ export default function SlotGame() {
         )}
 
         <div className="relative">
-          <div className="bg-gradient-to-b from-amber-950/40 via-black/60 to-amber-950/40 border-2 border-amber-700/40 rounded-xl p-1 shadow-2xl shadow-amber-900/20">
-            <div className="bg-gradient-to-b from-gray-900 to-black rounded-lg p-3 relative overflow-hidden">
-              <div className="absolute inset-0 bg-gradient-to-b from-white/5 via-transparent to-white/5 pointer-events-none" />
-              <div className="absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-black/80 to-transparent z-10 pointer-events-none" />
-              <div className="absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-black/80 to-transparent z-10 pointer-events-none" />
+          <div className="machine-frame rounded-2xl p-3 relative">
+            <div className="absolute inset-0 rounded-2xl overflow-hidden pointer-events-none z-20">
+              <div className="absolute top-0 left-0 right-0 flex justify-around px-6 pt-1">
+                {leds.slice(0, ledCount / 2).map((_, i) => (
+                  <div
+                    key={`top-${i}`}
+                    className="w-2 h-2 rounded-full led-dot"
+                    style={{
+                      backgroundColor: i % 2 === 0 ? "#f59e0b" : "#ef4444",
+                      animationDelay: `${i * 0.12}s`,
+                    }}
+                  />
+                ))}
+              </div>
+              <div className="absolute bottom-0 left-0 right-0 flex justify-around px-6 pb-1">
+                {leds.slice(ledCount / 2).map((_, i) => (
+                  <div
+                    key={`bot-${i}`}
+                    className="w-2 h-2 rounded-full led-dot"
+                    style={{
+                      backgroundColor: i % 2 === 0 ? "#ef4444" : "#f59e0b",
+                      animationDelay: `${(i + ledCount / 2) * 0.12}s`,
+                    }}
+                  />
+                ))}
+              </div>
+            </div>
 
-              <div className="relative flex gap-1 justify-center" data-testid="slot-reels">
+            <div className="text-center mb-2 relative z-10">
+              <span className="text-amber-400/80 text-xs font-bold tracking-[0.3em] uppercase">
+                {slot.name}
+              </span>
+            </div>
+
+            <div className="bg-black rounded-xl p-2 relative overflow-hidden border border-amber-900/50" data-testid="slot-reels">
+              <div className="absolute inset-0 reel-window z-10 pointer-events-none rounded-xl" />
+
+              <div className="flex gap-[3px] justify-center relative">
                 {Array(REEL_COUNT).fill(null).map((_, col) => {
-                  const reelStopped = !spinning || (lastResult && displayReels[col] === lastResult.reels[col]);
+                  const state = reelStates[col];
+                  const isThisReelSpinning = state === "spinning" || state === "stopping";
+                  const justStopped = flashingReels[col];
+
                   return (
                     <div
                       key={col}
-                      className={`flex flex-col gap-1 items-center p-1 rounded-md transition-all duration-200
-                        ${!reelStopped ? "bg-white/5" : "bg-transparent"}
-                        ${col < REEL_COUNT - 1 ? "border-r border-white/5" : ""}
-                      `}
+                      className={`relative overflow-hidden rounded-lg ${justStopped ? "reel-flash" : ""}`}
+                      style={{
+                        height: `${VISIBLE_HEIGHT}px`,
+                        width: "calc((100% - 12px) / 5)",
+                        backgroundColor: "#111",
+                      }}
                     >
-                      {Array(ROW_COUNT).fill(null).map((_, row) => (
+                      {col > 0 && (
+                        <div className="absolute left-0 top-0 bottom-0 w-[1px] bg-amber-700/30 z-20" />
+                      )}
+
+                      {isThisReelSpinning && reelStrips[col]?.length > 0 ? (
                         <div
-                          key={row}
-                          className={`transition-all duration-200 ${!reelStopped ? "blur-[2px] translate-y-[2px]" : ""}`}
+                          className="absolute left-0 right-0"
+                          style={{
+                            transform: `translateY(-${reelOffsets[col]}px)`,
+                            willChange: "transform",
+                          }}
                         >
-                          <SlotSymbol
-                            symbolId={displayReels[col]?.[row] ?? ""}
-                            symbols={symbols}
-                            size="lg"
-                            isWinning={!spinning && isSymbolOnWinningLine(col, row, winningLines)}
-                          />
+                          {reelStrips[col].map((symId, idx) => (
+                            <div key={idx} style={{ height: `${SYMBOL_HEIGHT}px` }} className="p-[2px]">
+                              <SlotSymbol symbolId={symId} symbols={symbols} size="reel" />
+                            </div>
+                          ))}
                         </div>
-                      ))}
+                      ) : (
+                        <div
+                          className={state === "stopped" ? "reel-stopped" : ""}
+                        >
+                          <div className="reel-strip">
+                            {Array(ROW_COUNT).fill(null).map((_, row) => (
+                              <div key={row} style={{ height: `${SYMBOL_HEIGHT}px` }} className="p-[2px]">
+                                <SlotSymbol
+                                  symbolId={displayReels[col]?.[row] ?? ""}
+                                  symbols={symbols}
+                                  size="reel"
+                                  isWinning={allStopped && !spinning && isSymbolOnWinningLine(col, row, winningLines)}
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
+              </div>
+
+              <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ top: `${SYMBOL_HEIGHT - 1}px` }}>
+                <div className="reel-separator h-[1px]" />
+              </div>
+              <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ top: `${SYMBOL_HEIGHT * 2 - 1}px` }}>
+                <div className="reel-separator h-[1px]" />
               </div>
 
               <div className="mt-2 flex justify-center gap-1">
                 {Array(9).fill(null).map((_, i) => (
                   <div
                     key={i}
-                    className={`h-1 rounded-full flex-1 transition-all duration-300 ${winningLines.includes(i) ? "bg-yellow-400 shadow-sm shadow-yellow-400" : "bg-white/10"}`}
+                    className={`h-1.5 rounded-full flex-1 transition-all duration-500 ${winningLines.includes(i)
+                      ? "bg-yellow-400 shadow-md shadow-yellow-400/50"
+                      : "bg-white/8"}`}
                   />
                 ))}
               </div>
             </div>
+
+            <div className="mt-3 flex items-center justify-center gap-3 relative z-10">
+              <button
+                onClick={toggleAutoSpin}
+                disabled={spinning && !autoSpin}
+                className="px-4 py-2 rounded-lg text-sm font-bold border border-amber-700/50 bg-black/50 text-amber-400 hover:bg-amber-900/30 disabled:opacity-40 transition-all"
+                data-testid="button-auto-spin"
+              >
+                <RotateCcw className={`h-4 w-4 inline mr-1 ${autoSpin ? "animate-spin text-yellow-400" : ""}`} />
+                {autoSpin ? "Stopp" : "Auto"}
+              </button>
+
+              <button
+                onClick={doSpin}
+                disabled={spinning || autoSpin}
+                className="spin-button-3d px-10 py-4 rounded-2xl text-lg font-extrabold text-black tracking-wide disabled:cursor-not-allowed"
+                data-testid="button-spin"
+              >
+                {spinning ? (
+                  <RotateCcw className="h-6 w-6 animate-spin inline" />
+                ) : freeSpins > 0 ? (
+                  <span className="flex items-center gap-2">
+                    <Star className="h-6 w-6" />
+                    GRATIS!
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-2">
+                    <Play className="h-6 w-6" />
+                    SPINN
+                  </span>
+                )}
+              </button>
+
+              <button
+                onClick={() => setBetAmount(Math.min(slot.maxBet, betAmount * 2))}
+                disabled={spinning || freeSpins > 0}
+                className="px-4 py-2 rounded-lg text-sm font-bold border border-amber-700/50 bg-black/50 text-amber-400 hover:bg-amber-900/30 disabled:opacity-40 transition-all"
+                data-testid="button-max-bet"
+              >
+                <Zap className="h-4 w-4 inline mr-1" />
+                2x
+              </button>
+            </div>
           </div>
 
           {showFreeSpinBanner && (
-            <div className="absolute inset-0 pointer-events-none z-20 flex items-center justify-center rounded-xl">
-              <div className="bg-black/80 rounded-xl px-8 py-5 text-center border-2 border-yellow-400 animate-bounce shadow-2xl shadow-yellow-400/30">
-                <Star className="h-8 w-8 text-yellow-400 mx-auto mb-2 animate-spin" />
-                <p className="text-yellow-300 text-xs font-medium uppercase tracking-wider">Gratis Spinn Vunnet!</p>
-                <p className="text-yellow-400 text-3xl font-bold">{lastResult?.freeSpinsWon} SPINN</p>
+            <div className="absolute inset-0 pointer-events-none z-30 flex items-center justify-center rounded-2xl">
+              <div className="bg-black/90 rounded-xl px-8 py-6 text-center border-2 border-yellow-400 shadow-2xl shadow-yellow-400/30">
+                <Star className="h-10 w-10 text-yellow-400 mx-auto mb-2 animate-spin" />
+                <p className="text-yellow-300 text-sm font-bold uppercase tracking-widest">Gratis Spinn!</p>
+                <p className="text-yellow-400 text-4xl font-extrabold">{lastResult?.freeSpinsWon}</p>
+                <p className="text-yellow-300/60 text-xs mt-1">spinn vunnet</p>
               </div>
             </div>
           )}
 
-          {lastResult && lastResult.winAmount > 0 && !showFreeSpinBanner && (
-            <div className="absolute inset-0 pointer-events-none z-10 flex items-center justify-center rounded-xl">
-              <div className="bg-black/75 rounded-xl px-6 py-4 text-center border border-yellow-400/80 shadow-xl shadow-yellow-400/20">
-                <p className="text-yellow-300 text-xs font-medium uppercase tracking-wider">Gevinst</p>
-                <p className="text-yellow-400 text-3xl font-bold">+{lastResult.winAmount.toFixed(2)} kr</p>
-                <p className="text-yellow-300/80 text-sm">{lastResult.multiplier}x</p>
+          {lastResult && lastResult.winAmount > 0 && !showFreeSpinBanner && allStopped && (
+            <div className="absolute inset-0 pointer-events-none z-20 flex items-center justify-center rounded-2xl">
+              <div className="bg-black/85 rounded-xl px-8 py-5 text-center border border-yellow-400/80 shadow-xl shadow-yellow-400/20">
+                <p className="text-yellow-300 text-xs font-bold uppercase tracking-widest">Gevinst!</p>
+                <p className="text-yellow-400 text-4xl font-extrabold">+{lastResult.winAmount.toFixed(2)} kr</p>
+                <p className="text-yellow-300/60 text-sm">{lastResult.multiplier}x multiplisator</p>
               </div>
             </div>
           )}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3">
-          <Card>
-            <CardContent className="pt-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm font-medium">Innsats per spinn</p>
-                  <p className="text-xs text-muted-foreground">{slot.minBet} - {slot.maxBet} kr</p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button variant="outline" size="sm" onClick={() => setBetAmount(Math.max(slot.minBet, betAmount - 1))} disabled={spinning || betAmount <= slot.minBet || freeSpins > 0} data-testid="button-bet-decrease">-</Button>
-                  <span className="font-bold text-primary min-w-[60px] text-center" data-testid="bet-amount">{freeSpins > 0 ? freeSpinBet : betAmount} kr</span>
-                  <Button variant="outline" size="sm" onClick={() => setBetAmount(Math.min(slot.maxBet, betAmount + 1))} disabled={spinning || betAmount >= slot.maxBet || freeSpins > 0} data-testid="button-bet-increase">+</Button>
-                </div>
+        <Card>
+          <CardContent className="pt-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">Innsats per spinn</p>
+                <p className="text-xs text-muted-foreground">{slot.minBet} - {slot.maxBet} kr</p>
               </div>
-              <Slider
-                min={slot.minBet}
-                max={Math.min(slot.maxBet, 100)}
-                step={1}
-                value={[freeSpins > 0 ? freeSpinBet : betAmount]}
-                onValueChange={([v]) => setBetAmount(v)}
-                disabled={spinning || freeSpins > 0}
-                data-testid="slider-bet"
-              />
-              <div className="grid grid-cols-5 gap-1">
-                {[slot.minBet, 5, 10, 25, slot.maxBet].map(amount => (
-                  <Button key={amount} variant="outline" size="sm" onClick={() => setBetAmount(amount)} disabled={spinning || freeSpins > 0} className="text-xs">
-                    {amount} kr
-                  </Button>
-                ))}
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => setBetAmount(Math.max(slot.minBet, betAmount - 1))} disabled={spinning || betAmount <= slot.minBet || freeSpins > 0} data-testid="button-bet-decrease">-</Button>
+                <span className="font-bold text-primary min-w-[60px] text-center" data-testid="bet-amount">{freeSpins > 0 ? freeSpinBet : betAmount} kr</span>
+                <Button variant="outline" size="sm" onClick={() => setBetAmount(Math.min(slot.maxBet, betAmount + 1))} disabled={spinning || betAmount >= slot.maxBet || freeSpins > 0} data-testid="button-bet-increase">+</Button>
               </div>
-            </CardContent>
-          </Card>
-
-          <div className="flex md:flex-col gap-2 justify-center">
-            <Button
-              variant="outline"
-              className="gap-2"
-              onClick={toggleAutoSpin}
-              disabled={spinning && !autoSpin}
-              data-testid="button-auto-spin"
-            >
-              <RotateCcw className={`h-4 w-4 ${autoSpin ? "text-primary animate-spin" : ""}`} />
-              {autoSpin ? "Stopp" : "Auto"}
-            </Button>
-            <Button
-              className="gap-2 text-base font-bold h-14 px-8 min-w-[140px]"
-              onClick={doSpin}
-              disabled={spinning || autoSpin}
-              data-testid="button-spin"
-            >
-              {spinning ? (
-                <RotateCcw className="h-5 w-5 animate-spin" />
-              ) : freeSpins > 0 ? (
-                <>
-                  <Star className="h-5 w-5" />
-                  Gratis Spinn!
-                </>
-              ) : (
-                <>
-                  <Play className="h-5 w-5" />
-                  Spinn!
-                </>
-              )}
-            </Button>
-            <Button
-              variant="outline"
-              className="gap-2"
-              onClick={() => setBetAmount(Math.min(slot.maxBet, betAmount * 2))}
+            </div>
+            <Slider
+              min={slot.minBet}
+              max={Math.min(slot.maxBet, 100)}
+              step={1}
+              value={[freeSpins > 0 ? freeSpinBet : betAmount]}
+              onValueChange={([v]) => setBetAmount(v)}
               disabled={spinning || freeSpins > 0}
-              data-testid="button-max-bet"
-            >
-              <Zap className="h-4 w-4" />
-              2x
-            </Button>
-          </div>
-        </div>
+              data-testid="slider-bet"
+            />
+            <div className="grid grid-cols-5 gap-1">
+              {[slot.minBet, 5, 10, 25, slot.maxBet].map(amount => (
+                <Button key={amount} variant="outline" size="sm" onClick={() => setBetAmount(amount)} disabled={spinning || freeSpins > 0} className="text-xs">
+                  {amount} kr
+                </Button>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
 
         {user.balance < slot.minBet && freeSpins === 0 && (
           <div className="rounded-md bg-yellow-900/30 border border-yellow-700/50 p-3 flex items-center justify-between gap-3">
